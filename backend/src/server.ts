@@ -1,22 +1,23 @@
 import Fastify from "fastify";
 import websocket from "@fastify/websocket";
+import { initDb, selectTasks, insertTask, updateTask, deleteTask } from "./db";
+import express from "express";
+import cors from "cors";
+import { selectTasks } from "./db";
+import type { Task } from "./types";
+import {
+  joinSchema,
+  createSchema,
+  updateSchema,
+  deleteSchema,
+} from "./schemas";
 
 const app = Fastify({ logger: true });
 await app.register(websocket);
 
-/** ---- Types & in-memory state (swap to Postgres later) ---- */
-type Task = { id: string; title: string; description?: string; done?: boolean };
-type BoardState = { clients: Set<any>; tasks: Map<string, Task> };
-const boards = new Map<string, BoardState>();
+// Keep only client lists in memory (for broadcasting). Data lives in Postgres.
+const clientsByBoard = new Map<string, Set<any>>();
 
-function ensureBoard(id: string): BoardState {
-  let b = boards.get(id);
-  if (!b) {
-    b = { clients: new Set(), tasks: new Map() };
-    boards.set(id, b);
-  }
-  return b;
-}
 function genId() {
   return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
 }
@@ -26,34 +27,19 @@ function send(ws: any, msg: unknown) {
   } catch {}
 }
 function broadcast(boardId: string, msg: unknown, except?: any) {
-  const b = boards.get(boardId);
-  if (!b) return;
-  for (const c of b.clients) if (c !== except) send(c, msg);
+  const set = clientsByBoard.get(boardId);
+  if (!set) return;
+  for (const c of set) if (c !== except) send(c, msg);
 }
 
-/** ---- Health (for sanity checks) ---- */
 app.get("/health", async () => ({ ok: true }));
 
-/**
- * WebSocket JSON protocol (client -> server):
- * {type:"join",   boardId}
- * {type:"create", boardId, task:{id?,title,description?,done?}}
- * {type:"update", boardId, task:{id,title?,description?,done?}}
- * {type:"delete", boardId, taskId}
- *
- * Server -> client events: hello, snapshot, created, updated, deleted, error
- */
-app.get("/ws", { websocket: true }, (ws /* raw WebSocket */, req) => {
+app.get("/ws", { websocket: true }, (ws /* raw socket */) => {
   let boardId: string | undefined;
 
-  // greet + basic protocol hint
-  send(ws, {
-    type: "hello",
-    ok: true,
-    protocol: ["join", "create", "update", "delete"],
-  });
+  send(ws, { type: "hello", ok: true });
 
-  ws.on("message", (buf: Buffer) => {
+  ws.on("message", async (buf: Buffer) => {
     let msg: any;
     try {
       msg = JSON.parse(buf.toString());
@@ -61,105 +47,131 @@ app.get("/ws", { websocket: true }, (ws /* raw WebSocket */, req) => {
       return send(ws, { type: "error", error: "invalid_json" });
     }
 
-    switch (msg?.type) {
-      case "join": {
-        const id = String(msg.boardId ?? "");
-        if (!id) return send(ws, { type: "error", error: "boardId_required" });
-        boardId = id;
-        const b = ensureBoard(id);
-        b.clients.add(ws);
-        // send current snapshot
-        send(ws, {
-          type: "snapshot",
-          boardId: id,
-          tasks: [...b.tasks.values()],
-        });
-        return;
-      }
+    // validate & handle
+    if (msg?.type === "join") {
+      const parsed = joinSchema.safeParse(msg);
+      if (!parsed.success) return send(ws, zodError(parsed.error));
+      const { boardId: id } = parsed.data;
 
-      case "create": {
-        if (!boardId) return send(ws, { type: "error", error: "join_first" });
-        const b = ensureBoard(boardId);
-        const t = msg.task ?? {};
-        const id = t.id ?? genId();
-        const title = (t.title ?? "").toString().trim();
-        if (!title) return send(ws, { type: "error", error: "title_required" });
-        const task: Task = {
-          id,
-          title,
-          description: t.description,
-          done: !!t.done,
-        };
-        b.tasks.set(id, task);
-        const payload = { type: "created", boardId, task };
+      boardId = id;
+      if (!clientsByBoard.has(id)) clientsByBoard.set(id, new Set());
+      clientsByBoard.get(id)!.add(ws);
+
+      try {
+        const tasks = await selectTasks(id);
+        send(ws, { type: "snapshot", boardId: id, tasks });
+      } catch (e) {
+        app.log.error(e);
+        send(ws, { type: "error", error: "db_select_failed" });
+      }
+      return;
+    }
+
+    if (msg?.type === "create") {
+      const parsed = createSchema.safeParse(msg);
+      if (!parsed.success) return send(ws, zodError(parsed.error));
+      if (!boardId || boardId !== parsed.data.boardId)
+        return send(ws, { type: "error", error: "join_first" });
+
+      const t = parsed.data.task;
+      const task: Task = {
+        id: t.id ?? genId(),
+        title: t.title,
+        description: t.description,
+        done: !!t.done,
+      };
+
+      try {
+        const saved = await insertTask(boardId, task);
+        const payload = { type: "created", boardId, task: saved };
         send(ws, payload);
         broadcast(boardId, payload, ws);
-        return;
+      } catch (e) {
+        app.log.error(e);
+        send(ws, { type: "error", error: "db_insert_failed" });
       }
+      return;
+    }
 
-      case "update": {
-        if (!boardId) return send(ws, { type: "error", error: "join_first" });
-        const b = ensureBoard(boardId);
-        const t = msg.task ?? {};
-        const id = String(t.id ?? "");
-        if (!id) return send(ws, { type: "error", error: "id_required" });
-        const existing = b.tasks.get(id);
-        if (!existing) return send(ws, { type: "error", error: "not_found" });
-        const updated: Task = {
-          ...existing,
-          ...(t.title !== undefined ? { title: String(t.title) } : {}),
-          ...(t.description !== undefined
-            ? { description: String(t.description) }
-            : {}),
-          ...(t.done !== undefined ? { done: !!t.done } : {}),
-        };
-        b.tasks.set(id, updated);
+    if (msg?.type === "update") {
+      const parsed = updateSchema.safeParse(msg);
+      if (!parsed.success) return send(ws, zodError(parsed.error));
+      if (!boardId || boardId !== parsed.data.boardId)
+        return send(ws, { type: "error", error: "join_first" });
+
+      const t = parsed.data.task;
+      try {
+        const updated = await updateTask(boardId, {
+          id: t.id,
+          title: t.title,
+          description: t.description,
+          done: t.done,
+        });
+        if (!updated) return send(ws, { type: "error", error: "not_found" });
+
         const payload = { type: "updated", boardId, task: updated };
         send(ws, payload);
         broadcast(boardId, payload, ws);
-        return;
+      } catch (e) {
+        app.log.error(e);
+        send(ws, { type: "error", error: "db_update_failed" });
       }
+      return;
+    }
 
-      case "delete": {
-        if (!boardId) return send(ws, { type: "error", error: "join_first" });
-        const b = ensureBoard(boardId);
-        const id = String(msg.taskId ?? "");
-        if (!id) return send(ws, { type: "error", error: "id_required" });
-        if (!b.tasks.has(id))
-          return send(ws, { type: "error", error: "not_found" });
-        b.tasks.delete(id);
+    if (msg?.type === "delete") {
+      const parsed = deleteSchema.safeParse(msg);
+      if (!parsed.success) return send(ws, zodError(parsed.error));
+      if (!boardId || boardId !== parsed.data.boardId)
+        return send(ws, { type: "error", error: "join_first" });
+
+      const id = parsed.data.taskId;
+      try {
+        const ok = await deleteTask(boardId, id);
+        if (!ok) return send(ws, { type: "error", error: "not_found" });
+
         const payload = { type: "deleted", boardId, taskId: id };
         send(ws, payload);
         broadcast(boardId, payload, ws);
-        return;
+      } catch (e) {
+        app.log.error(e);
+        send(ws, { type: "error", error: "db_delete_failed" });
       }
-
-      default:
-        return send(ws, { type: "error", error: "unknown_type" });
+      return;
     }
+
+    // unknown type
+    return send(ws, { type: "error", error: "unknown_type" });
   });
 
   ws.on("close", () => {
     if (!boardId) return;
-    const b = boards.get(boardId);
-    b?.clients.delete(ws);
+    const set = clientsByBoard.get(boardId);
+    if (set) set.delete(ws);
   });
 
   ws.on("error", (err) => app.log.error({ err }, "ws error"));
 });
 
-/** ---- Heartbeat: kill dead sockets so broadcasts don’t hang ---- */
-const HEARTBEAT_MS = 30000;
-setInterval(() => {
-  for (const [, { clients }] of boards) {
-    for (const ws of clients) {
-      try {
-        ws.ping?.();
-      } catch {}
-    }
-  }
-}, HEARTBEAT_MS);
+function zodError(err: any) {
+  // compact error payload that’s still useful in the client
+  const issues =
+    err?.issues?.map((i: any) => ({ path: i.path, message: i.message })) ?? [];
+  return { type: "error", error: "validation_error", issues };
+}
 
-/** ---- Start ---- */
-await app.listen({ host: "127.0.0.1", port: 3002 });
-app.log.info("Real-time taskboard WS ready on ws://127.0.0.1:3002/ws");
+// 1) Ensure DB tables, 2) start server
+await initDb();
+const PORT = Number(process.env.PORT || 3002);
+// Fetch tasks for a given boardId
+app.get("/tasks", async (req, reply) => {
+  const boardId = (req.query as any).boardId;
+  if (!boardId) {
+    return reply.status(400).send({ error: "boardId required" });
+  }
+  const tasks = await selectTasks(boardId);
+  return tasks;
+});
+
+await app.listen({ host: "127.0.0.1", port: PORT });
+app.log.info(`RT Taskboard + Postgres on ws://127.0.0.1:${PORT}/ws`);

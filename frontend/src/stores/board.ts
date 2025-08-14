@@ -12,38 +12,109 @@ export const useBoardStore = defineStore("board", {
     boardId: "alpha" as string,
     tasks: [] as Task[],
     ws: null as WebSocket | null,
+    // reconnect state
+    reconnectAttempts: 0,
+    maxReconnectAttempts: 8,
+    reconnectTimer: 0 as any,
   }),
 
   actions: {
-    connect(boardId?: string) {
+    async connect(boardId?: string) {
       if (boardId) this.boardId = boardId;
-      this.disconnect();
+      this._clearReconnect();
 
-      const ws = new WebSocket("ws://127.0.0.1:3002/ws");
+      // 1. Load initial tasks via HTTP GET (fallback)
+      try {
+        const res = await fetch(
+          `http://127.0.0.1:3002/tasks?boardId=${encodeURIComponent(
+            this.boardId
+          )}`
+        );
+        if (res.ok) {
+          this.tasks = await res.json();
+        } else {
+          console.warn("Failed to load initial tasks via HTTP");
+        }
+      } catch (err) {
+        console.warn("HTTP fetch error:", err);
+      }
+
+      // 2. Open WebSocket connection
+      this._openSocket();
+    },
+
+    _openSocket() {
+      // close any existing
+      try {
+        this.ws?.close();
+      } catch {}
+      const ws = new WebSocket(`ws://127.0.0.1:3002/ws`);
       this.ws = ws;
 
       ws.onopen = () => {
+        // reset backoff
+        this.reconnectAttempts = 0;
+        // (re)join same board → server sends fresh snapshot
         ws.send(JSON.stringify({ type: "join", boardId: this.boardId }));
       };
 
       ws.onmessage = (e) => {
         try {
           const evt = JSON.parse(e.data);
-          if (evt.type === "snapshot") this.tasks = evt.tasks;
-          if (evt.type === "created") this.tasks = [...this.tasks, evt.task];
-          if (evt.type === "updated")
-            this.tasks = this.tasks.map((t) =>
-              t.id === evt.task.id ? evt.task : t
-            );
-          if (evt.type === "deleted")
-            this.tasks = this.tasks.filter((t) => t.id !== evt.taskId);
+          switch (evt.type) {
+            case "snapshot":
+              this.tasks = evt.tasks;
+              break;
+            case "created":
+              this.tasks = [...this.tasks, evt.task];
+              break;
+            case "updated":
+              this.tasks = this.tasks.map((t) =>
+                t.id === evt.task.id ? evt.task : t
+              );
+              break;
+            case "deleted":
+              this.tasks = this.tasks.filter((t) => t.id !== evt.taskId);
+              break;
+            case "error":
+              console.warn("WS error:", evt.error);
+              break;
+          }
         } catch {
-          /* ignore */
+          // ignore parse errors
         }
+      };
+
+      ws.onclose = () => {
+        this._scheduleReconnect();
+      };
+
+      ws.onerror = () => {
+        // Let onclose trigger the retry; avoid double reconnects
       };
     },
 
+    _scheduleReconnect() {
+      // cap attempts
+      if (this.reconnectAttempts >= this.maxReconnectAttempts) return;
+      this.reconnectAttempts += 1;
+
+      // exponential backoff: 0.5s, 1s, 2s, 4s, ... (cap at ~8s)
+      const delay = Math.min(
+        8000,
+        500 * Math.pow(2, this.reconnectAttempts - 1)
+      );
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = setTimeout(() => this._openSocket(), delay);
+    },
+
+    _clearReconnect() {
+      this.reconnectAttempts = 0;
+      clearTimeout(this.reconnectTimer);
+    },
+
     disconnect() {
+      this._clearReconnect();
       try {
         this.ws?.close();
       } catch {}
