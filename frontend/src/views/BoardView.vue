@@ -7,19 +7,24 @@ const route = useRoute();
 const router = useRouter();
 const store = useBoardStore();
 
-// Read boardId from the URL (e.g., /b/alpha)
 const currentBoardFromRoute = (): string =>
   String(route.params.boardId ?? "alpha");
 
-// Local inputs
+// Inputs
 const boardInput = ref<string>(currentBoardFromRoute());
 const title = ref<string>("");
+const description = ref<string>("");
 
-// Derived stats
+// Editing state
+const editingTask = ref<any | null>(null);
+const editTitle = ref("");
+const editDescription = ref("");
+
+// Stats
 const total = computed<number>(() => store.tasks.length);
 const done = computed<number>(() => store.tasks.filter((t) => t.done).length);
 
-// Update URL to /b/<board>; watcher below will connect
+// Connect
 function connect() {
   const id = (boardInput.value || "").trim() || "alpha";
   if (String(route.params.boardId) !== id) {
@@ -31,18 +36,32 @@ function connect() {
 
 function addTask() {
   const t = (title.value || "").trim();
+  const d = (description.value || "").trim();
   if (!t) return;
-  store.createTask(t);
+  store.createTask(t, d);
   title.value = "";
+  description.value = "";
+}
+function startEdit(task: any) {
+  editingTask.value = { ...task };
+  editTitle.value = task.title;
+  editDescription.value = task.description || "";
+}
+function saveEdit() {
+  if (!editingTask.value) return;
+  store.editTask(editingTask.value.id, editTitle.value, editDescription.value);
+  editingTask.value = null;
+}
+function cancelEdit() {
+  editingTask.value = null;
 }
 
-// Auto-connect whenever /b/:boardId changes (including first load)
 watch(
   () => route.params.boardId,
   (id) => {
     const boardId = String(id ?? "alpha");
-    boardInput.value = boardId; // keep input in sync with URL
-    store.connect(boardId); // join + snapshot
+    boardInput.value = boardId;
+    store.connect(boardId);
   },
   { immediate: true }
 );
@@ -55,6 +74,25 @@ onBeforeUnmount(() => store.disconnect());
     <v-app-bar color="primary" density="comfortable" prominent>
       <v-app-bar-title>Real-Time Taskboard</v-app-bar-title>
       <v-spacer />
+
+      <!-- NEW: connection status chip (optional; requires store.status) -->
+      <v-chip
+        v-if="store.status"
+        class="mr-3"
+        :color="
+          store.status === 'connected'
+            ? 'green'
+            : store.status === 'connecting'
+            ? 'orange'
+            : 'red'
+        "
+        text-color="white"
+        label
+        density="comfortable"
+      >
+        {{ store.status }}
+      </v-chip>
+
       <v-chip class="mr-3" variant="elevated"
         >Done {{ done }} / {{ total }}</v-chip
       >
@@ -86,7 +124,14 @@ onBeforeUnmount(() => store.disconnect());
               </v-row>
               <v-row dense>
                 <v-col cols="12" class="d-flex justify-end">
-                  <v-btn color="primary" @click="connect">Connect & Join</v-btn>
+                  <!-- optional loading if you set store.status -->
+                  <v-btn
+                    color="primary"
+                    @click="connect"
+                    :loading="store.status === 'connecting'"
+                  >
+                    Connect & Join
+                  </v-btn>
                 </v-col>
               </v-row>
             </v-card-text>
@@ -94,18 +139,35 @@ onBeforeUnmount(() => store.disconnect());
 
           <!-- Task add -->
           <v-card class="mb-6 w-100" variant="outlined">
-            <v-card-text class="d-flex align-center" style="gap: 12px">
+            <v-card-text>
+              <div class="d-flex align-center" style="gap: 12px">
+                <v-text-field
+                  v-model="title"
+                  label="New task title"
+                  variant="outlined"
+                  hide-details
+                  @keydown.enter="addTask"
+                  style="flex: 1; min-width: 0"
+                />
+                <!-- NEW: disable when empty -->
+                <v-btn
+                  color="primary"
+                  @click="addTask"
+                  :disabled="!title.trim()"
+                  prepend-icon="mdi-plus"
+                >
+                  Add
+                </v-btn>
+              </div>
+
               <v-text-field
-                v-model="title"
-                label="New task title"
+                class="mt-3"
+                v-model="description"
+                label="Description (optional)"
                 variant="outlined"
                 hide-details
                 @keydown.enter="addTask"
-                style="flex: 1; min-width: 0"
               />
-              <v-btn color="primary" @click="addTask" prepend-icon="mdi-plus"
-                >Add</v-btn
-              >
             </v-card-text>
           </v-card>
 
@@ -120,16 +182,50 @@ onBeforeUnmount(() => store.disconnect());
                   />
                 </template>
 
-                <v-list-item-title
-                  :class="t.done ? 'text-decoration-line-through' : ''"
-                >
-                  {{ t.title }}
-                </v-list-item-title>
-                <v-list-item-subtitle class="opacity-70">
-                  {{ t.id }}
-                </v-list-item-subtitle>
+                <template v-if="editingTask?.id === t.id">
+                  <v-list-item-content>
+                    <v-text-field
+                      v-model="editTitle"
+                      label="Edit title"
+                      hide-details
+                      density="comfortable"
+                    />
+                    <v-text-field
+                      v-model="editDescription"
+                      label="Edit description"
+                      hide-details
+                      density="comfortable"
+                    />
+                    <div class="d-flex" style="gap: 8px; margin-top: 4px">
+                      <v-btn size="small" color="primary" @click="saveEdit"
+                        >Save</v-btn
+                      >
+                      <v-btn size="small" variant="tonal" @click="cancelEdit"
+                        >Cancel</v-btn
+                      >
+                    </div>
+                  </v-list-item-content>
+                </template>
+                <template v-else>
+                  <v-list-item-title
+                    :class="t.done ? 'text-decoration-line-through' : ''"
+                  >
+                    {{ t.title }}
+                  </v-list-item-title>
+                  <v-list-item-subtitle v-if="t.description" class="opacity-70">
+                    {{ t.description }}
+                  </v-list-item-subtitle>
+                  <v-list-item-subtitle class="opacity-50">
+                    {{ t.id }}
+                  </v-list-item-subtitle>
+                </template>
 
                 <template #append>
+                  <v-btn
+                    variant="text"
+                    icon="mdi-pencil"
+                    @click="startEdit(t)"
+                  />
                   <v-btn
                     variant="text"
                     icon="mdi-delete"
@@ -140,9 +236,9 @@ onBeforeUnmount(() => store.disconnect());
 
               <v-divider v-if="store.tasks.length" />
               <v-list-item v-else>
-                <v-list-item-title class="opacity-70"
-                  >No tasks yet — add one.</v-list-item-title
-                >
+                <v-list-item-title class="opacity-70">
+                  No tasks yet — add one.
+                </v-list-item-title>
               </v-list-item>
             </v-list>
           </v-card>

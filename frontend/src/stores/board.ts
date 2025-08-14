@@ -12,7 +12,6 @@ export const useBoardStore = defineStore("board", {
     boardId: "alpha" as string,
     tasks: [] as Task[],
     ws: null as WebSocket | null,
-    // reconnect state
     reconnectAttempts: 0,
     maxReconnectAttempts: 8,
     reconnectTimer: 0 as any,
@@ -20,41 +19,37 @@ export const useBoardStore = defineStore("board", {
 
   actions: {
     async connect(boardId?: string) {
-      if (boardId) this.boardId = boardId;
-      this._clearReconnect();
+      if (boardId) this.boardId = boardId.trim();
+      this.disconnect(); // stop old connection
 
-      // 1. Load initial tasks via HTTP GET (fallback)
+      // 1. Fetch existing tasks immediately
       try {
         const res = await fetch(
-          `http://127.0.0.1:3002/tasks?boardId=${encodeURIComponent(
-            this.boardId
-          )}`
+          `http://127.0.0.1:3002/tasks?boardId=${this.boardId}`
         );
         if (res.ok) {
           this.tasks = await res.json();
         } else {
-          console.warn("Failed to load initial tasks via HTTP");
+          console.warn("Failed to fetch tasks for board:", this.boardId);
         }
       } catch (err) {
-        console.warn("HTTP fetch error:", err);
+        console.error("Error fetching tasks:", err);
       }
 
-      // 2. Open WebSocket connection
+      // 2. Open WebSocket for live updates
+      this._clearReconnect();
       this._openSocket();
     },
 
     _openSocket() {
-      // close any existing
       try {
         this.ws?.close();
       } catch {}
-      const ws = new WebSocket(`ws://127.0.0.1:3002/ws`);
+      const ws = new WebSocket("ws://127.0.0.1:3002/ws");
       this.ws = ws;
 
       ws.onopen = () => {
-        // reset backoff
         this.reconnectAttempts = 0;
-        // (re)join same board → server sends fresh snapshot
         ws.send(JSON.stringify({ type: "join", boardId: this.boardId }));
       };
 
@@ -80,26 +75,17 @@ export const useBoardStore = defineStore("board", {
               console.warn("WS error:", evt.error);
               break;
           }
-        } catch {
-          // ignore parse errors
-        }
+        } catch {}
       };
 
       ws.onclose = () => {
         this._scheduleReconnect();
       };
-
-      ws.onerror = () => {
-        // Let onclose trigger the retry; avoid double reconnects
-      };
     },
 
     _scheduleReconnect() {
-      // cap attempts
       if (this.reconnectAttempts >= this.maxReconnectAttempts) return;
-      this.reconnectAttempts += 1;
-
-      // exponential backoff: 0.5s, 1s, 2s, 4s, ... (cap at ~8s)
+      this.reconnectAttempts++;
       const delay = Math.min(
         8000,
         500 * Math.pow(2, this.reconnectAttempts - 1)
@@ -127,18 +113,25 @@ export const useBoardStore = defineStore("board", {
         JSON.stringify({
           type: "create",
           boardId: this.boardId,
-          task: { title, description },
+          task: { title, description: description || "" },
         })
       );
     },
 
     toggleTask(id: string, done: boolean) {
       if (!this.ws || this.ws.readyState !== 1) return;
+      const existing = this.tasks.find((t) => t.id === id);
+      if (!existing) return;
       this.ws.send(
         JSON.stringify({
           type: "update",
           boardId: this.boardId,
-          task: { id, done },
+          task: {
+            id,
+            title: existing.title,
+            description: existing.description || "",
+            done,
+          },
         })
       );
     },
@@ -146,7 +139,22 @@ export const useBoardStore = defineStore("board", {
     deleteTask(id: string) {
       if (!this.ws || this.ws.readyState !== 1) return;
       this.ws.send(
-        JSON.stringify({ type: "delete", boardId: this.boardId, taskId: id })
+        JSON.stringify({
+          type: "delete",
+          boardId: this.boardId,
+          taskId: id,
+        })
+      );
+    },
+
+    editTask(id: string, title: string, description?: string) {
+      if (!this.ws || this.ws.readyState !== 1) return;
+      this.ws.send(
+        JSON.stringify({
+          type: "update",
+          boardId: this.boardId,
+          task: { id, title, description: description || "" },
+        })
       );
     },
   },

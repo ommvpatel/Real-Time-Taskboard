@@ -1,9 +1,6 @@
 import Fastify from "fastify";
 import websocket from "@fastify/websocket";
 import { initDb, selectTasks, insertTask, updateTask, deleteTask } from "./db";
-import express from "express";
-import cors from "cors";
-import { selectTasks } from "./db";
 import type { Task } from "./types";
 import {
   joinSchema,
@@ -12,10 +9,41 @@ import {
   deleteSchema,
 } from "./schemas";
 
+import Redis from "ioredis";
+
+// --- Redis pub/sub (cluster fanout) ---
+const instanceId = Math.random().toString(36).slice(2);
+const redis = process.env.REDIS_URL ? new Redis(process.env.REDIS_URL) : null;
+const sub = process.env.REDIS_URL ? new Redis(process.env.REDIS_URL) : null;
+
+const CHANNEL = "taskboard-events";
+
+function fanout(boardId: string, payload: unknown, except?: any) {
+  // local broadcast
+  broadcast(boardId, payload, except);
+  // cross-instance broadcast
+  if (redis) {
+    redis.publish(CHANNEL, JSON.stringify({ boardId, payload, instanceId }));
+  }
+}
+
+if (sub) {
+  sub.subscribe(CHANNEL);
+  sub.on("message", (_channel, payload) => {
+    try {
+      const evt = JSON.parse(payload);
+      if (evt.instanceId === instanceId) return; // ignore our own
+      // evt: { boardId, payload, instanceId }
+      broadcast(evt.boardId, evt.payload); // deliver to local clients
+    } catch {}
+  });
+}
+
+// --- Fastify + WS ---
 const app = Fastify({ logger: true });
 await app.register(websocket);
 
-// Keep only client lists in memory (for broadcasting). Data lives in Postgres.
+// Connected clients per board (in-memory)
 const clientsByBoard = new Map<string, Set<any>>();
 
 function genId() {
@@ -34,6 +62,7 @@ function broadcast(boardId: string, msg: unknown, except?: any) {
 
 app.get("/health", async () => ({ ok: true }));
 
+// NOTE: keeping your working handler signature
 app.get("/ws", { websocket: true }, (ws /* raw socket */) => {
   let boardId: string | undefined;
 
@@ -47,7 +76,6 @@ app.get("/ws", { websocket: true }, (ws /* raw socket */) => {
       return send(ws, { type: "error", error: "invalid_json" });
     }
 
-    // validate & handle
     if (msg?.type === "join") {
       const parsed = joinSchema.safeParse(msg);
       if (!parsed.success) return send(ws, zodError(parsed.error));
@@ -77,7 +105,7 @@ app.get("/ws", { websocket: true }, (ws /* raw socket */) => {
       const task: Task = {
         id: t.id ?? genId(),
         title: t.title,
-        description: t.description,
+        description: t.description || "",
         done: !!t.done,
       };
 
@@ -85,7 +113,7 @@ app.get("/ws", { websocket: true }, (ws /* raw socket */) => {
         const saved = await insertTask(boardId, task);
         const payload = { type: "created", boardId, task: saved };
         send(ws, payload);
-        broadcast(boardId, payload, ws);
+        fanout(boardId, payload, ws); // <-- Redis fanout
       } catch (e) {
         app.log.error(e);
         send(ws, { type: "error", error: "db_insert_failed" });
@@ -104,14 +132,14 @@ app.get("/ws", { websocket: true }, (ws /* raw socket */) => {
         const updated = await updateTask(boardId, {
           id: t.id,
           title: t.title,
-          description: t.description,
+          description: t.description || "",
           done: t.done,
         });
         if (!updated) return send(ws, { type: "error", error: "not_found" });
 
         const payload = { type: "updated", boardId, task: updated };
         send(ws, payload);
-        broadcast(boardId, payload, ws);
+        fanout(boardId, payload, ws); // <-- Redis fanout
       } catch (e) {
         app.log.error(e);
         send(ws, { type: "error", error: "db_update_failed" });
@@ -132,7 +160,7 @@ app.get("/ws", { websocket: true }, (ws /* raw socket */) => {
 
         const payload = { type: "deleted", boardId, taskId: id };
         send(ws, payload);
-        broadcast(boardId, payload, ws);
+        fanout(boardId, payload, ws); // <-- Redis fanout
       } catch (e) {
         app.log.error(e);
         send(ws, { type: "error", error: "db_delete_failed" });
@@ -140,7 +168,6 @@ app.get("/ws", { websocket: true }, (ws /* raw socket */) => {
       return;
     }
 
-    // unknown type
     return send(ws, { type: "error", error: "unknown_type" });
   });
 
@@ -154,24 +181,28 @@ app.get("/ws", { websocket: true }, (ws /* raw socket */) => {
 });
 
 function zodError(err: any) {
-  // compact error payload that’s still useful in the client
   const issues =
     err?.issues?.map((i: any) => ({ path: i.path, message: i.message })) ?? [];
   return { type: "error", error: "validation_error", issues };
 }
 
-// 1) Ensure DB tables, 2) start server
-await initDb();
-const PORT = Number(process.env.PORT || 3002);
-// Fetch tasks for a given boardId
+// HTTP: fetch tasks
 app.get("/tasks", async (req, reply) => {
   const boardId = (req.query as any).boardId;
   if (!boardId) {
     return reply.status(400).send({ error: "boardId required" });
   }
-  const tasks = await selectTasks(boardId);
-  return tasks;
+  try {
+    const tasks = await selectTasks(boardId);
+    return tasks;
+  } catch (e) {
+    app.log.error(e);
+    return reply.status(500).send({ error: "db_select_failed" });
+  }
 });
 
+// Start
+await initDb();
+const PORT = Number(process.env.PORT || 3002);
 await app.listen({ host: "127.0.0.1", port: PORT });
-app.log.info(`RT Taskboard + Postgres on ws://127.0.0.1:${PORT}/ws`);
+app.log.info(`RT Taskboard on ws://127.0.0.1:${PORT}/ws`);
