@@ -1,7 +1,7 @@
 import dotenv from "dotenv";
 dotenv.config();
 import { Pool } from "pg";
-import type { Task, DbTaskRow } from "./types";
+import type { Task, DbTaskRow } from "./types.js";
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
@@ -29,7 +29,7 @@ export async function selectTasks(boardId: string): Promise<Task[]> {
       ORDER BY created_at ASC`,
     [boardId]
   );
-  return rows.map((r) => ({
+  return rows.map((r: DbTaskRow) => ({
     id: r.id,
     title: r.title,
     description: r.description ?? undefined,
@@ -44,7 +44,7 @@ export async function insertTask(boardId: string, task: Task): Promise<Task> {
      RETURNING id, title, description, done`,
     [task.id, boardId, task.title, task.description ?? null, !!task.done]
   );
-  const r = rows[0];
+  const r: DbTaskRow = rows[0];
   return {
     id: r.id,
     title: r.title,
@@ -58,7 +58,7 @@ export async function updateTask(
   partial: Partial<Task> & { id: string }
 ): Promise<Task | null> {
   const sets: string[] = [];
-  const vals: any[] = [];
+  const vals: unknown[] = [];
   let i = 1;
 
   if (partial.title !== undefined) {
@@ -80,8 +80,8 @@ export async function updateTask(
       `SELECT id, title, description, done FROM tasks WHERE id=$1 AND board_id=$2`,
       [partial.id, boardId]
     );
-    if (!rows[0]) return null;
-    const r = rows[0];
+    const r: DbTaskRow | undefined = rows[0];
+    if (!r) return null;
     return {
       id: r.id,
       title: r.title,
@@ -100,8 +100,8 @@ export async function updateTask(
   vals.push(partial.id, boardId);
 
   const { rows } = await pool.query<DbTaskRow>(query, vals);
-  if (!rows[0]) return null;
-  const r = rows[0];
+  const r: DbTaskRow | undefined = rows[0];
+  if (!r) return null;
   return {
     id: r.id,
     title: r.title,
@@ -114,9 +114,9 @@ export async function deleteTask(
   boardId: string,
   id: string
 ): Promise<boolean> {
-  const { rowCount } = await pool.query(
+  const res = await pool.query(
     `DELETE FROM tasks WHERE id=$1 AND board_id=$2`,
     [id, boardId]
   );
-  return rowCount > 0;
+  return (res.rowCount ?? 0) > 0; // <- handle possible null
 }

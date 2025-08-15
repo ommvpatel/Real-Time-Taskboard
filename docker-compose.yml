@@ -1,0 +1,44 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: taskboard
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  backend:
+    build: ./backend
+    environment:
+      PORT: 3002
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/taskboard
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      - postgres
+      - redis
+    ports:
+      - "3002:3002"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Pass value from your host's environment (reads from .env if using `--env-file`)
+        VITE_API_BASE: ${VITE_API_BASE}
+    depends_on:
+      - backend
+    ports:
+      - "5173:80"
+    env_file:
+      - ./frontend/.env
+
+volumes:
+  pgdata:

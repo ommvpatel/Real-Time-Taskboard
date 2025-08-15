@@ -7,14 +7,26 @@ export type Task = {
   done?: boolean;
 };
 
+const API_BASE =
+  (import.meta as any)?.env?.VITE_API_BASE || "http://127.0.0.1:3002";
+const WS_BASE = API_BASE.replace(
+  /^http/i,
+  API_BASE.startsWith("https") ? "wss" : "ws"
+);
+
 export const useBoardStore = defineStore("board", {
   state: () => ({
     boardId: "alpha" as string,
     tasks: [] as Task[],
     ws: null as WebSocket | null,
+
+    // connection status for UI
+    status: "disconnected" as "disconnected" | "connecting" | "connected",
+
+    // reconnect state
     reconnectAttempts: 0,
     maxReconnectAttempts: 8,
-    reconnectTimer: 0 as any,
+    reconnectTimer: 0 as number | ReturnType<typeof setTimeout>,
   }),
 
   actions: {
@@ -22,11 +34,9 @@ export const useBoardStore = defineStore("board", {
       if (boardId) this.boardId = boardId.trim();
       this.disconnect(); // stop old connection
 
-      // 1. Fetch existing tasks immediately
+      // 1) HTTP snapshot
       try {
-        const res = await fetch(
-          `http://127.0.0.1:3002/tasks?boardId=${this.boardId}`
-        );
+        const res = await fetch(`${API_BASE}/tasks?boardId=${this.boardId}`);
         if (res.ok) {
           this.tasks = await res.json();
         } else {
@@ -36,7 +46,7 @@ export const useBoardStore = defineStore("board", {
         console.error("Error fetching tasks:", err);
       }
 
-      // 2. Open WebSocket for live updates
+      // 2) WS live stream
       this._clearReconnect();
       this._openSocket();
     },
@@ -45,11 +55,14 @@ export const useBoardStore = defineStore("board", {
       try {
         this.ws?.close();
       } catch {}
-      const ws = new WebSocket("ws://127.0.0.1:3002/ws");
+      this.status = "connecting";
+
+      const ws = new WebSocket(`${WS_BASE}/ws`);
       this.ws = ws;
 
       ws.onopen = () => {
         this.reconnectAttempts = 0;
+        this.status = "connected";
         ws.send(JSON.stringify({ type: "join", boardId: this.boardId }));
       };
 
@@ -75,28 +88,37 @@ export const useBoardStore = defineStore("board", {
               console.warn("WS error:", evt.error);
               break;
           }
-        } catch {}
+        } catch {
+          // ignore bad frames
+        }
+      };
+
+      ws.onerror = () => {
+        // mark as disconnected; onclose will handle retry
+        this.status = "disconnected";
       };
 
       ws.onclose = () => {
+        this.status = "disconnected";
         this._scheduleReconnect();
       };
     },
 
     _scheduleReconnect() {
       if (this.reconnectAttempts >= this.maxReconnectAttempts) return;
-      this.reconnectAttempts++;
+      this.reconnectAttempts += 1;
+
       const delay = Math.min(
         8000,
         500 * Math.pow(2, this.reconnectAttempts - 1)
       );
-      clearTimeout(this.reconnectTimer);
+      clearTimeout(this.reconnectTimer as any);
       this.reconnectTimer = setTimeout(() => this._openSocket(), delay);
     },
 
     _clearReconnect() {
       this.reconnectAttempts = 0;
-      clearTimeout(this.reconnectTimer);
+      clearTimeout(this.reconnectTimer as any);
     },
 
     disconnect() {
@@ -105,10 +127,11 @@ export const useBoardStore = defineStore("board", {
         this.ws?.close();
       } catch {}
       this.ws = null;
+      this.status = "disconnected";
     },
 
     createTask(title: string, description?: string) {
-      if (!this.ws || this.ws.readyState !== 1) return;
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
       this.ws.send(
         JSON.stringify({
           type: "create",
@@ -119,7 +142,7 @@ export const useBoardStore = defineStore("board", {
     },
 
     toggleTask(id: string, done: boolean) {
-      if (!this.ws || this.ws.readyState !== 1) return;
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
       const existing = this.tasks.find((t) => t.id === id);
       if (!existing) return;
       this.ws.send(
@@ -137,7 +160,7 @@ export const useBoardStore = defineStore("board", {
     },
 
     deleteTask(id: string) {
-      if (!this.ws || this.ws.readyState !== 1) return;
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
       this.ws.send(
         JSON.stringify({
           type: "delete",
@@ -148,7 +171,7 @@ export const useBoardStore = defineStore("board", {
     },
 
     editTask(id: string, title: string, description?: string) {
-      if (!this.ws || this.ws.readyState !== 1) return;
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
       this.ws.send(
         JSON.stringify({
           type: "update",

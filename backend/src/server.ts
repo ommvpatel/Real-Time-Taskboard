@@ -1,20 +1,43 @@
 import Fastify from "fastify";
 import websocket from "@fastify/websocket";
-import { initDb, selectTasks, insertTask, updateTask, deleteTask } from "./db";
-import type { Task } from "./types";
+import {
+  initDb,
+  selectTasks,
+  insertTask,
+  updateTask,
+  deleteTask,
+} from "./db.js";
+import type { Task } from "./types.js";
 import {
   joinSchema,
   createSchema,
   updateSchema,
   deleteSchema,
-} from "./schemas";
+} from "./schemas.js";
+import cors from "@fastify/cors";
 
-import Redis from "ioredis";
+// ⬇️ replace your existing Redis import/usage with this
+import * as IORedis from "ioredis";
 
-// --- Redis pub/sub (cluster fanout) ---
+// Handle both ESM/CJS builds
+const RedisCtor: any = (IORedis as any).default ?? (IORedis as any);
+
 const instanceId = Math.random().toString(36).slice(2);
-const redis = process.env.REDIS_URL ? new Redis(process.env.REDIS_URL) : null;
-const sub = process.env.REDIS_URL ? new Redis(process.env.REDIS_URL) : null;
+const redis = process.env.REDIS_URL
+  ? new RedisCtor(process.env.REDIS_URL)
+  : null;
+const sub = process.env.REDIS_URL ? new RedisCtor(process.env.REDIS_URL) : null;
+
+if (sub) {
+  sub.subscribe("taskboard-events");
+  sub.on("message", (_channel: string, payload: string) => {
+    try {
+      const evt = JSON.parse(payload);
+      if (evt.instanceId === instanceId) return;
+      broadcast(evt.boardId, evt.payload); // send to local clients
+    } catch {}
+  });
+}
 
 const CHANNEL = "taskboard-events";
 
@@ -29,7 +52,7 @@ function fanout(boardId: string, payload: unknown, except?: any) {
 
 if (sub) {
   sub.subscribe(CHANNEL);
-  sub.on("message", (_channel, payload) => {
+  sub.on("message", (_channel: string, payload: string) => {
     try {
       const evt = JSON.parse(payload);
       if (evt.instanceId === instanceId) return; // ignore our own
@@ -42,6 +65,7 @@ if (sub) {
 // --- Fastify + WS ---
 const app = Fastify({ logger: true });
 await app.register(websocket);
+await app.register(cors, { origin: true });
 
 // Connected clients per board (in-memory)
 const clientsByBoard = new Map<string, Set<any>>();
@@ -177,7 +201,7 @@ app.get("/ws", { websocket: true }, (ws /* raw socket */) => {
     if (set) set.delete(ws);
   });
 
-  ws.on("error", (err) => app.log.error({ err }, "ws error"));
+  ws.on("error", (err: unknown) => app.log.error({ err }, "ws error"));
 });
 
 function zodError(err: any) {
@@ -204,5 +228,7 @@ app.get("/tasks", async (req, reply) => {
 // Start
 await initDb();
 const PORT = Number(process.env.PORT || 3002);
-await app.listen({ host: "127.0.0.1", port: PORT });
+// was: await app.listen({ host: "127.0.0.1", port: PORT });
+await app.listen({ host: "0.0.0.0", port: PORT });
+
 app.log.info(`RT Taskboard on ws://127.0.0.1:${PORT}/ws`);
