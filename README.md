@@ -41,3 +41,5 @@ Syncs tasks instantly between connected clients using **WebSockets**.
 - Netlify / Vercel (frontend deploy)
 
 ---
+
+http://localhost:5173/b/alpha
